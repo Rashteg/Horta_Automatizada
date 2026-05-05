@@ -1,4 +1,4 @@
-// 2026-04-28 America/Sao_Paulo
+// 2026-04-28 America/Sao_Paulo.
 // ESP RainMaker - SENSOR DA HORTA
 // Completo: Interface original, Megafone UDP (Canais 1 a 10) e Função Name
 
