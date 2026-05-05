@@ -1,1 +1,0 @@
-https://rainmaker.espressif.com/qrcode.html?data={"ver":"v1","name":"PROV_RELE_01","pop":"12345678","transport":"ble"}
