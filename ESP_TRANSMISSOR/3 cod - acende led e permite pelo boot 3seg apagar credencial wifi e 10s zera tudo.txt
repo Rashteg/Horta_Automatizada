@@ -1,0 +1,184 @@
+// 2026-04-21 10:40 America/Sao_Paulo — RainMaker com LED onboard no GPIO8 e botão BOOT no GPIO9 para Wi-Fi reset (>3 s) e Factory Reset (>10 s)
+
+#include <Arduino.h>
+#include "RMaker.h"
+#include "WiFi.h"
+#include "WiFiProv.h"
+
+// ==============================
+// CONFIGURAÇÕES DO DISPOSITIVO
+// ==============================
+const char *service_name = "PROV_C3_01";
+const char *pop = "12345678";
+
+// LED onboard do ESP32-C3 SuperMini
+// Em muitos SuperMini o LED azul fica no GPIO8 e é invertido.
+static const int gpio_led = 8;
+
+// Botão BOOT do ESP32-C3 SuperMini
+// Geralmente fica no GPIO9 e é ativo em LOW.
+static const int gpio_button = 9;
+
+// Estado lógico do dispositivo no app
+bool switch_state = true;
+
+// Device RainMaker
+static Switch *my_switch = NULL;
+
+// LED invertido: LOW = liga, HIGH = desliga
+void setOnboardLed(bool on) {
+  digitalWrite(gpio_led, on ? LOW : HIGH);
+}
+
+// ==============================
+// EVENTOS DO PROVISIONAMENTO
+// ==============================
+void sysProvEvent(arduino_event_t *sys_event) {
+  switch (sys_event->event_id) {
+    case ARDUINO_EVENT_PROV_START:
+      Serial.printf("\nProvisioning Started with name \"%s\" and PoP \"%s\" on BLE\n", service_name, pop);
+      Serial.println("Scan this QR code from the provisioning application for Provisioning.");
+      WiFiProv.printQR(service_name, pop, "ble");
+      break;
+
+    case ARDUINO_EVENT_PROV_INIT:
+      Serial.println("Inicializando provisionamento BLE...");
+      WiFiProv.disableAutoStop(10000);
+      break;
+
+    case ARDUINO_EVENT_PROV_CRED_RECV:
+      Serial.println("Recebendo credenciais de Wi-Fi...");
+      break;
+
+    case ARDUINO_EVENT_PROV_CRED_SUCCESS:
+      Serial.println("Credenciais recebidas com sucesso.");
+      WiFiProv.endProvision();
+      break;
+
+    case ARDUINO_EVENT_WIFI_STA_CONNECTED:
+      Serial.println("Conectado ao Wi-Fi.");
+      break;
+
+    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+      Serial.print("IP: ");
+      Serial.println(WiFi.localIP());
+      break;
+
+    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+      Serial.println("Wi-Fi desconectado.");
+      break;
+
+    default:
+      break;
+  }
+}
+
+// ==============================
+// CALLBACK DO SWITCH NO APP
+// ==============================
+void write_callback(Device *device, Param *param, const param_val_t val,
+                    void *priv_data, write_ctx_t *ctx) {
+  const char *param_name = param->getParamName();
+
+  if (strcmp(param_name, "Power") == 0) {
+    switch_state = val.val.b;
+    setOnboardLed(switch_state);
+
+    Serial.printf("App enviou: %s\n", switch_state ? "LIGADO" : "DESLIGADO");
+
+    param->updateAndReport(val);
+  }
+}
+
+// ==============================
+// TRATAMENTO DO BOTÃO BOOT
+// ==============================
+// >10 s = Factory Reset
+// >3 s  = Reset Wi-Fi
+// clique curto = alterna LED e atualiza no app
+void handleBootButton() {
+  if (digitalRead(gpio_button) == LOW) {
+    delay(80);  // debounce inicial
+
+    if (digitalRead(gpio_button) != LOW) {
+      return;
+    }
+
+    const unsigned long startTime = millis();
+
+    while (digitalRead(gpio_button) == LOW) {
+      delay(50);
+    }
+
+    const unsigned long pressTime = millis() - startTime;
+
+    if (pressTime > 10000) {
+      Serial.println("Botao: Factory Reset.");
+      RMakerFactoryReset(2);
+    } else if (pressTime > 3000) {
+      Serial.println("Botao: Reset Wi-Fi.");
+      RMakerWiFiReset(2);
+    } else {
+      switch_state = !switch_state;
+      setOnboardLed(switch_state);
+
+      Serial.printf("Botao: alternando LED para %s\n", switch_state ? "LIGADO" : "DESLIGADO");
+
+      if (my_switch) {
+        my_switch->updateAndReportParam(ESP_RMAKER_DEF_POWER_NAME, switch_state);
+      }
+    }
+  }
+}
+
+// ==============================
+// SETUP
+// ==============================
+void setup() {
+  Serial.begin(115200);
+  delay(1500);
+
+  Serial.println();
+  Serial.println("Bootando ESP RainMaker...");
+
+  pinMode(gpio_led, OUTPUT);
+  setOnboardLed(switch_state);
+
+  pinMode(gpio_button, INPUT_PULLUP);
+
+  Node my_node = RMaker.initNode("ESP32-C3 Inteligente");
+
+  my_switch = new Switch("LED Azul", NULL, switch_state);
+  if (!my_switch) {
+    Serial.println("Erro ao criar switch RainMaker.");
+    return;
+  }
+
+  my_switch->addCb(write_callback);
+  my_node.addDevice(*my_switch);
+
+  WiFi.onEvent(sysProvEvent);
+
+  WiFiProv.initProvision(NETWORK_PROV_SCHEME_BLE,
+                         NETWORK_PROV_SCHEME_HANDLER_FREE_BTDM);
+
+  RMaker.start();
+
+  WiFiProv.beginProvision(NETWORK_PROV_SCHEME_BLE,
+                          NETWORK_PROV_SCHEME_HANDLER_FREE_BTDM,
+                          NETWORK_PROV_SECURITY_1,
+                          pop,
+                          service_name);
+
+  Serial.println("RainMaker iniciado.");
+  Serial.println("Abra o app ESP RainMaker e faça o pareamento.");
+  Serial.println("Botao BOOT: >3 s = Reset Wi-Fi | >10 s = Factory Reset");
+}
+
+// ==============================
+// LOOP
+// ==============================
+void loop() {
+  handleBootButton();
+  delay(100);
+}

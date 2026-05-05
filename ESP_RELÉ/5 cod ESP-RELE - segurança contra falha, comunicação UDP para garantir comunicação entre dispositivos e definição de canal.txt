@@ -1,0 +1,254 @@
+// 2026-04-28 America/Sao_Paulo
+// ESP RainMaker - Relé Inteligente (Ouvinte UDP de Zonas 1 a 10 + Fail-Safe Corrigido)
+#include <Arduino.h>
+#include "RMaker.h"
+#include "WiFi.h"
+#include "WiFiProv.h"
+#include <Preferences.h>
+#include <WiFiUdp.h>
+
+const char *service_name = "PROV_RELE_01";
+const char *pop = "12345678";
+const char *service_key = "12345678";
+
+static const int gpio_led = 8;
+static const int gpio_button = 9;
+static const int gpio_rele = 4;
+
+bool switch_state = false; // Sempre inicia desligado (Fail-Safe)
+static Switch *my_switch = NULL;
+Preferences prefs;
+const char *PREF_NS = "dasrum_rm";
+const char *PREF_SOFTAP = "softap_once";
+
+// ==============================
+// CONFIGURAÇÕES UDP E CANAL
+// ==============================
+WiFiUDP udp;
+const int udpPort = 8888;
+unsigned long ultima_msg_udp_ms = 0;
+int canal_comunicacao = 1; // CANAL PADRÃO (1 a 10)
+const unsigned long TIMEOUT_UDP_MS = 30000; // 30s sem ouvir = CORTA ÁGUA
+
+// ---> CORREÇÃO DO CRASH LOOP DE WI-FI <---
+bool udp_iniciado = false; 
+
+enum ProvisionMode { PROV_MODE_BLE = 0, PROV_MODE_SOFTAP = 1 };
+ProvisionMode currentProvMode = PROV_MODE_BLE;
+static bool last_button_state = HIGH;
+static unsigned long press_start_ms = 0;
+static uint8_t click_count = 0;
+static unsigned long sequence_start_ms = 0;
+static unsigned long last_click_ms = 0;
+
+static const unsigned long DEBOUNCE_MS = 40;
+static const unsigned long SHORT_CLICK_MAX_MS = 1200;
+static const unsigned long CLICK_DECISION_PAUSE_MS = 1000;
+static const unsigned long CLICK_SEQUENCE_MAX_MS = 6000;
+static const unsigned long WIFI_RESET_MIN_MS = 3000;
+static const unsigned long WIFI_RESET_MAX_MS = 4000;
+static const uint8_t SOFTAP_CLICKS = 3;
+static const uint8_t FACTORY_RESET_MIN_CLICKS = 5;
+static const uint8_t FACTORY_RESET_MAX_CLICKS = 7;
+
+// ==============================
+// MEMÓRIA NVS
+// ==============================
+void salvarPrefInt(const char* chave, int valor) {
+  prefs.begin(PREF_NS, false); prefs.putInt(chave, valor); prefs.end();
+}
+
+void carregarConfiguracoesRele() {
+  prefs.begin(PREF_NS, true);
+  canal_comunicacao = prefs.getInt("canal_com", 1);
+  prefs.end();
+}
+
+void setOnboardLed(bool on) { digitalWrite(gpio_led, on ? LOW : HIGH); }
+void setRelay(bool on) { digitalWrite(gpio_rele, on ? HIGH : LOW); }
+
+void applyOutputsFromState(bool on) {
+  switch_state = on;
+  setRelay(on);
+  setOnboardLed(on);
+}
+
+// ==============================
+// ROTINAS DE OUVIDO UDP E SEGURANÇA
+// ==============================
+void escutarSensorUDP() {
+  if (WiFi.status() == WL_CONNECTED) {
+    int packetSize = udp.parsePacket();
+    if (packetSize) {
+      char incomingPacket[255];
+      int len = udp.read(incomingPacket, 255);
+      if (len > 0) incomingPacket[len] = 0;
+
+      String msg = String(incomingPacket);
+      String comandoON = "ZONA:" + String(canal_comunicacao) + ":ON";
+      String comandoOFF = "ZONA:" + String(canal_comunicacao) + ":OFF";
+      
+      if (msg == comandoON) {
+        ultima_msg_udp_ms = millis();
+        if (!switch_state) { 
+          Serial.println(">>> Comando Local UDP Recebido: O Sensor mandou LIGAR a água!");
+          applyOutputsFromState(true);
+          if (my_switch && WiFi.status() == WL_CONNECTED) my_switch->updateAndReportParam("Power", true);
+        }
+      } 
+      else if (msg == comandoOFF) {
+        ultima_msg_udp_ms = millis();
+        if (switch_state) { 
+          Serial.println(">>> Comando Local UDP Recebido: O Sensor mandou DESLIGAR a água.");
+          applyOutputsFromState(false);
+          if (my_switch && WiFi.status() == WL_CONNECTED) my_switch->updateAndReportParam("Power", false);
+        }
+      }
+    }
+  }
+}
+
+void verificarSegurancaRele() {
+  if (switch_state) { 
+    unsigned long agora = millis();
+    if (agora - ultima_msg_udp_ms > TIMEOUT_UDP_MS) {
+      Serial.printf("!!! ALARME FAIL-SAFE: Sinal UDP da Zona %d perdido por 30s! Cortando a água !!!\n", canal_comunicacao);
+      applyOutputsFromState(false);
+      
+      // CORREÇÃO: O Relé só avisa a Nuvem do corte se a internet estiver viva. 
+      // Tentar avisar a nuvem offline gera crash no RainMaker!
+      if (my_switch && WiFi.status() == WL_CONNECTED) {
+          my_switch->updateAndReportParam("Power", false);
+      }
+    }
+  }
+}
+
+// ==============================
+// FUNÇÕES DO SISTEMA E RAINMAKER
+// ==============================
+const char *getProvModeName() { return (currentProvMode == PROV_MODE_SOFTAP) ? "SoftAP" : "BLE"; }
+const char *getQrTransportName() { return (currentProvMode == PROV_MODE_SOFTAP) ? "softap" : "ble"; }
+void saveSoftAPOnce(bool enable) { prefs.begin(PREF_NS, false); prefs.putBool(PREF_SOFTAP, enable); prefs.end(); }
+bool loadSoftAPOnce() { prefs.begin(PREF_NS, true); bool value = prefs.getBool(PREF_SOFTAP, false); prefs.end(); return value; }
+void clearClickSequence() { click_count = 0; sequence_start_ms = 0; last_click_ms = 0; }
+void blinkFeedback(uint8_t times, unsigned long onMs, unsigned long offMs) { bool p = switch_state; for (uint8_t i=0; i<times; i++) { setOnboardLed(true); delay(onMs); setOnboardLed(false); delay(offMs); } setOnboardLed(p); }
+void rebootToSoftAPRecovery(uint8_t totalClicks) { saveSoftAPOnce(true); delay(300); ESP.restart(); }
+void executeWiFiReset() { clearClickSequence(); delay(300); RMakerWiFiReset(2); }
+void executeFactoryResetByClicks(uint8_t totalClicks) { clearClickSequence(); delay(300); RMakerFactoryReset(2); }
+
+void registerShortClick(unsigned long now) {
+  if (click_count == 0) { click_count = 1; sequence_start_ms = now; last_click_ms = now; } 
+  else {
+    if ((now - sequence_start_ms) > CLICK_SEQUENCE_MAX_MS) { click_count = 1; sequence_start_ms = now; last_click_ms = now; } 
+    else { click_count++; last_click_ms = now; }
+  }
+  if (click_count > FACTORY_RESET_MAX_CLICKS) clearClickSequence();
+}
+
+void processClickSequenceIfReady(unsigned long now) {
+  if (click_count == 0) return;
+  if ((now - last_click_ms) < CLICK_DECISION_PAUSE_MS) return;
+  uint8_t totalClicks = click_count; clearClickSequence();
+  if (totalClicks == SOFTAP_CLICKS) rebootToSoftAPRecovery(totalClicks);
+  else if (totalClicks >= FACTORY_RESET_MIN_CLICKS && totalClicks <= FACTORY_RESET_MAX_CLICKS) executeFactoryResetByClicks(totalClicks);
+}
+
+void handleBootButton() {
+  bool current_state = digitalRead(gpio_button);
+  unsigned long now = millis();
+  if (last_button_state == HIGH && current_state == LOW) press_start_ms = now;
+  if (last_button_state == LOW && current_state == HIGH) {
+    unsigned long press_time = now - press_start_ms;
+    if (press_time < DEBOUNCE_MS) { last_button_state = current_state; return; }
+    if (press_time >= WIFI_RESET_MIN_MS && press_time <= WIFI_RESET_MAX_MS) executeWiFiReset();
+    else if (press_time <= SHORT_CLICK_MAX_MS) registerShortClick(now);
+    else clearClickSequence();
+  }
+  processClickSequenceIfReady(now);
+  last_button_state = current_state;
+}
+
+void sysProvEvent(arduino_event_t *sys_event) {
+  switch (sys_event->event_id) {
+    case ARDUINO_EVENT_PROV_START: Serial.println("Provisioning Started"); WiFiProv.printQR(service_name, pop, getQrTransportName()); break;
+    case ARDUINO_EVENT_PROV_INIT: WiFiProv.disableAutoStop(10000); break;
+    case ARDUINO_EVENT_PROV_CRED_SUCCESS: WiFiProv.endProvision(); if (currentProvMode == PROV_MODE_SOFTAP) saveSoftAPOnce(false); break;
+    case ARDUINO_EVENT_WIFI_STA_GOT_IP: 
+      // ---> CORREÇÃO: Garante que a porta UDP só seja aberta uma vez, evitando o Crash Loop!
+      if (!udp_iniciado) {
+        udp.begin(udpPort); 
+        udp_iniciado = true;
+        Serial.println("Ouvido UDP ativado na porta 8888.");
+      }
+      Serial.print("IP: "); Serial.println(WiFi.localIP());
+      break;
+    default: break;
+  }
+}
+
+void write_callback(Device *device, Param *param, const param_val_t val, void *priv_data, write_ctx_t *ctx) {
+  const char *param_name = param->getParamName();
+  
+  if (strcmp(param_name, "Power") == 0) {
+    bool new_state = val.val.b;
+    applyOutputsFromState(new_state);
+    Serial.printf("App Nuvem enviou Power: %s\n", switch_state ? "LIGADO" : "DESLIGADO");
+    param->updateAndReport(val);
+  }
+
+  if (strcmp(param_name, "Canal de Comunicação") == 0) {
+    canal_comunicacao = val.val.i;
+    salvarPrefInt("canal_com", canal_comunicacao);
+    Serial.printf("Relé pareado com o Canal (Zona): %d\n", canal_comunicacao);
+    param->updateAndReport(val);
+  }
+}
+
+void selectProvisionModeAtBoot() { if (loadSoftAPOnce()) currentProvMode = PROV_MODE_SOFTAP; else currentProvMode = PROV_MODE_BLE; }
+
+void startProvisioning() {
+  WiFi.onEvent(sysProvEvent);
+  if (currentProvMode == PROV_MODE_BLE) { WiFiProv.initProvision(NETWORK_PROV_SCHEME_BLE, NETWORK_PROV_SCHEME_HANDLER_FREE_BTDM); RMaker.start(); WiFiProv.beginProvision(NETWORK_PROV_SCHEME_BLE, NETWORK_PROV_SCHEME_HANDLER_FREE_BTDM, NETWORK_PROV_SECURITY_1, pop, service_name); } 
+  else { WiFiProv.initProvision(NETWORK_PROV_SCHEME_SOFTAP, NETWORK_PROV_SCHEME_HANDLER_NONE); RMaker.start(); WiFiProv.beginProvision(NETWORK_PROV_SCHEME_SOFTAP, NETWORK_PROV_SCHEME_HANDLER_NONE, NETWORK_PROV_SECURITY_1, pop, service_name, service_key); }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1500);
+
+  Serial.println();
+  Serial.println("Bootando ESP RainMaker - Relé Inteligente (Modo UDP Listener)...");
+
+  carregarConfiguracoesRele();
+
+  pinMode(gpio_led, OUTPUT);
+  pinMode(gpio_button, INPUT_PULLUP);
+  pinMode(gpio_rele, OUTPUT);
+
+  switch_state = false;
+  applyOutputsFromState(switch_state);
+  last_button_state = digitalRead(gpio_button);
+
+  selectProvisionModeAtBoot();
+
+  Node my_node = RMaker.initNode("ESP32-C3 Rele");
+  my_switch = new Switch("rele_esp", NULL, switch_state);
+  
+  Param canal_param("Canal de Comunicação", NULL, value(canal_comunicacao), PROP_FLAG_READ | PROP_FLAG_WRITE | PROP_FLAG_PERSIST); 
+  canal_param.addUIType(ESP_RMAKER_UI_SLIDER); 
+  canal_param.addBounds(value(1), value(10), value(1));
+  my_switch->addParam(canal_param);
+
+  my_switch->addCb(write_callback);
+  my_node.addDevice(*my_switch);
+
+  startProvisioning();
+}
+
+void loop() {
+  handleBootButton();
+  escutarSensorUDP();
+  verificarSegurancaRele();
+  delay(10);
+}

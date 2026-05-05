@@ -1,0 +1,134 @@
+#include <Arduino.h>
+#include "RMaker.h"
+#include "WiFi.h"
+#include "WiFiProv.h"
+
+// ==============================
+// CONFIGURAÇÕES DO DISPOSITIVO
+// ==============================
+const char *service_name = "PROV_C3_01";
+const char *pop = "12345678";
+
+// GPIO controlado pelo app
+static int gpio_switch = 7;
+
+// Estado inicial
+bool switch_state = true;
+
+// Device RainMaker
+static Switch *my_switch = NULL;
+
+// ==============================
+// EVENTOS DO PROVISIONAMENTO
+// ==============================
+void sysProvEvent(arduino_event_t *sys_event) {
+  switch (sys_event->event_id) {
+    case ARDUINO_EVENT_PROV_START:
+      Serial.printf("\nProvisioning Started with name \"%s\" and PoP \"%s\" on BLE\n", service_name, pop);
+      Serial.println("Scan this QR code from the provisioning application for Provisioning.");
+      WiFiProv.printQR(service_name, pop, "ble");
+      break;
+
+    case ARDUINO_EVENT_PROV_INIT:
+      Serial.println("Inicializando provisionamento BLE...");
+      WiFiProv.disableAutoStop(10000);
+      break;
+
+    case ARDUINO_EVENT_PROV_CRED_RECV:
+      Serial.println("Recebendo credenciais de Wi-Fi...");
+      break;
+
+    case ARDUINO_EVENT_PROV_CRED_SUCCESS:
+      Serial.println("Credenciais recebidas com sucesso.");
+      WiFiProv.endProvision();
+      break;
+
+    case ARDUINO_EVENT_WIFI_STA_CONNECTED:
+      Serial.println("Conectado ao Wi-Fi.");
+      break;
+
+    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+      Serial.print("IP: ");
+      Serial.println(WiFi.localIP());
+      break;
+
+    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+      Serial.println("Wi-Fi desconectado.");
+      break;
+
+    default:
+      break;
+  }
+}
+
+// ==============================
+// CALLBACK DO SWITCH NO APP
+// ==============================
+void write_callback(Device *device, Param *param, const param_val_t val,
+                    void *priv_data, write_ctx_t *ctx) {
+  const char *param_name = param->getParamName();
+
+  if (strcmp(param_name, "Power") == 0) {
+    switch_state = val.val.b;
+    digitalWrite(gpio_switch, switch_state ? HIGH : LOW);
+
+    Serial.printf("App enviou: %s\n", switch_state ? "LIGADO" : "DESLIGADO");
+
+    param->updateAndReport(val);
+  }
+}
+
+// ==============================
+// SETUP
+// ==============================
+void setup() {
+  Serial.begin(115200);
+  delay(1500);
+
+  Serial.println();
+  Serial.println("Bootando ESP RainMaker...");
+
+  // Configura saída
+  pinMode(gpio_switch, OUTPUT);
+  digitalWrite(gpio_switch, switch_state ? HIGH : LOW);
+
+  // Cria o nó RainMaker
+  Node my_node = RMaker.initNode("ESP32-C3 Inteligente");
+
+  // Cria o switch
+  my_switch = new Switch("Interruptor", &gpio_switch);
+  if (!my_switch) {
+    Serial.println("Erro ao criar switch RainMaker.");
+    return;
+  }
+
+  my_switch->addCb(write_callback);
+  my_node.addDevice(*my_switch);
+
+  // Eventos do Wi-Fi / Provisionamento
+  WiFi.onEvent(sysProvEvent);
+
+  // Inicializa BLE provisioning
+  WiFiProv.initProvision(NETWORK_PROV_SCHEME_BLE,
+                         NETWORK_PROV_SCHEME_HANDLER_FREE_BTDM);
+
+  // Inicia RainMaker
+  RMaker.start();
+
+  // Inicia provisionamento
+  WiFiProv.beginProvision(NETWORK_PROV_SCHEME_BLE,
+                          NETWORK_PROV_SCHEME_HANDLER_FREE_BTDM,
+                          NETWORK_PROV_SECURITY_1,
+                          pop,
+                          service_name);
+
+  Serial.println("RainMaker iniciado.");
+  Serial.println("Abra o app ESP RainMaker e faça o pareamento.");
+}
+
+// ==============================
+// LOOP
+// ==============================
+void loop() {
+  delay(100);
+}

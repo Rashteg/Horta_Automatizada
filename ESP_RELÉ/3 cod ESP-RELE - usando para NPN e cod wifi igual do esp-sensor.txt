@@ -1,0 +1,419 @@
+// 2026-04-28 America/Sao_Paulo
+// ESP RainMaker - Relé Inteligente (Com Wi-Fi/Reset aprimorado do código 9)
+// Hardware: ESP32-C3 SuperMini | GPIO4 -> Resistor 4.7k -> Base Transistor NPN -> Módulo Relé (Active LOW)
+
+#include <Arduino.h>
+#include "RMaker.h"
+#include "WiFi.h"
+#include "WiFiProv.h"
+#include <Preferences.h>
+
+// ==============================
+// CONFIGURAÇÕES DO DISPOSITIVO
+// ==============================
+const char *service_name = "PROV_RELE_01";
+const char *pop = "12345678";
+const char *service_key = "12345678";
+
+// Pinos ESP32-C3 SuperMini
+static const int gpio_led = 8;
+static const int gpio_button = 9;
+static const int gpio_rele = 4;
+
+// Estado lógico do dispositivo no app
+bool switch_state = false;
+static Switch *my_switch = NULL;
+
+// NVS / Preferences
+Preferences prefs;
+const char *PREF_NS = "dasrum_rm";
+const char *PREF_SOFTAP = "softap_once";
+
+// ==============================
+// MODOS DE PROVISIONAMENTO
+// ==============================
+enum ProvisionMode {
+  PROV_MODE_BLE = 0,
+  PROV_MODE_SOFTAP = 1
+};
+ProvisionMode currentProvMode = PROV_MODE_BLE;
+
+// ==============================
+// CONTROLE DO BOTÃO BOOT
+// ==============================
+static bool last_button_state = HIGH;
+static unsigned long press_start_ms = 0;
+
+static uint8_t click_count = 0;
+static unsigned long sequence_start_ms = 0;
+static unsigned long last_click_ms = 0;
+
+// Constantes de tempo aprimoradas (Herdadas do código do Sensor)
+static const unsigned long DEBOUNCE_MS = 40;
+static const unsigned long SHORT_CLICK_MAX_MS = 1200;
+static const unsigned long CLICK_DECISION_PAUSE_MS = 1000;
+static const unsigned long CLICK_SEQUENCE_MAX_MS = 6000;
+static const unsigned long WIFI_RESET_MIN_MS = 3000;
+static const unsigned long WIFI_RESET_MAX_MS = 4000;
+
+static const uint8_t SOFTAP_CLICKS = 3;
+static const uint8_t FACTORY_RESET_MIN_CLICKS = 5;
+static const uint8_t FACTORY_RESET_MAX_CLICKS = 7;
+
+// ==============================
+// FUNÇÕES AUXILIARES DE HARDWARE
+// ==============================
+void setOnboardLed(bool on) {
+  // LED onboard do ESP32-C3 SuperMini acende em LOW
+  digitalWrite(gpio_led, on ? LOW : HIGH);
+}
+
+void setRelay(bool on) {
+  // Lógica corrigida para o Transistor NPN: HIGH liga o NPN (que aterra o relé)
+  digitalWrite(gpio_rele, on ? HIGH : LOW);
+}
+
+void applyOutputsFromState(bool on) {
+  switch_state = on;
+  setRelay(on);
+  setOnboardLed(on);
+}
+
+// ==============================
+// FUNÇÕES DE RECUPERAÇÃO/SISTEMA
+// ==============================
+const char *getProvModeName() {
+  return (currentProvMode == PROV_MODE_SOFTAP) ? "SoftAP" : "BLE";
+}
+
+const char *getQrTransportName() {
+  return (currentProvMode == PROV_MODE_SOFTAP) ? "softap" : "ble";
+}
+
+void saveSoftAPOnce(bool enable) {
+  prefs.begin(PREF_NS, false);
+  prefs.putBool(PREF_SOFTAP, enable);
+  prefs.end();
+}
+
+bool loadSoftAPOnce() {
+  prefs.begin(PREF_NS, true);
+  bool value = prefs.getBool(PREF_SOFTAP, false);
+  prefs.end();
+  return value;
+}
+
+void clearClickSequence() {
+  click_count = 0;
+  sequence_start_ms = 0;
+  last_click_ms = 0;
+}
+
+void blinkFeedback(uint8_t times, unsigned long onMs, unsigned long offMs) {
+  bool previous_state = switch_state;
+  for (uint8_t i = 0; i < times; i++) {
+    setOnboardLed(true);
+    delay(onMs);
+    setOnboardLed(false);
+    delay(offMs);
+  }
+  setOnboardLed(previous_state);
+}
+
+// ==============================
+// RESET / RECUPERAÇÃO
+// ==============================
+void rebootToSoftAPRecovery(uint8_t totalClicks) {
+  Serial.printf("Sequência válida: %u cliques detectados.\n", totalClicks);
+  Serial.println("Entrando em modo temporário SoftAP...");
+
+  blinkFeedback(2, 150, 150);
+
+  saveSoftAPOnce(true);
+  delay(300);
+  ESP.restart();
+}
+
+void executeWiFiReset() {
+  Serial.println("Botão: Reset Wi-Fi.");
+  Serial.println("Apagando somente as credenciais de Wi-Fi salvas.");
+
+  blinkFeedback(3, 150, 150);
+
+  clearClickSequence();
+  delay(300);
+  RMakerWiFiReset(2);
+}
+
+void executeFactoryResetByClicks(uint8_t totalClicks) {
+  Serial.printf("Sequência válida: %u cliques detectados.\n", totalClicks);
+  Serial.println("Botão: Factory Reset.");
+  Serial.println("Apagando configurações do RainMaker/provisionamento. Firmware permanece gravado.");
+
+  blinkFeedback(5, 150, 150);
+
+  clearClickSequence();
+  delay(300);
+  RMakerFactoryReset(2);
+}
+
+void registerShortClick(unsigned long now) {
+  if (click_count == 0) {
+    click_count = 1;
+    sequence_start_ms = now;
+    last_click_ms = now;
+  } else {
+    if ((now - sequence_start_ms) > CLICK_SEQUENCE_MAX_MS) {
+      Serial.println("Tempo máximo da sequência excedido. Reiniciando contagem de cliques.");
+      click_count = 1;
+      sequence_start_ms = now;
+      last_click_ms = now;
+    } else {
+      click_count++;
+      last_click_ms = now;
+    }
+  }
+
+  Serial.printf("Clique curto %u detectado. Aguardando pausa de 1 segundo para decidir...\n", click_count);
+  if (click_count > FACTORY_RESET_MAX_CLICKS) {
+    Serial.println("Mais de 7 cliques detectados. Sequência ignorada para evitar reset acidental.");
+    clearClickSequence();
+  }
+}
+
+void processClickSequenceIfReady(unsigned long now) {
+  if (click_count == 0) {
+    return;
+  }
+
+  if ((now - last_click_ms) < CLICK_DECISION_PAUSE_MS) {
+    return;
+  }
+
+  uint8_t totalClicks = click_count;
+  clearClickSequence();
+
+  if (totalClicks == SOFTAP_CLICKS) {
+    rebootToSoftAPRecovery(totalClicks);
+    return;
+  }
+
+  if (totalClicks >= FACTORY_RESET_MIN_CLICKS && totalClicks <= FACTORY_RESET_MAX_CLICKS) {
+    executeFactoryResetByClicks(totalClicks);
+    return;
+  }
+
+  Serial.printf("Sequência de %u cliques ignorada.\n", totalClicks);
+  Serial.println("Use 3 cliques para SoftAP ou 5 a 7 cliques para Factory Reset.");
+}
+
+// ==============================
+// TRATAMENTO DO BOTÃO BOOT
+// ==============================
+void handleBootButton() {
+  bool current_state = digitalRead(gpio_button);
+  unsigned long now = millis();
+
+  if (last_button_state == HIGH && current_state == LOW) {
+    press_start_ms = now;
+  }
+
+  if (last_button_state == LOW && current_state == HIGH) {
+    unsigned long press_time = now - press_start_ms;
+
+    if (press_time < DEBOUNCE_MS) {
+      last_button_state = current_state;
+      return;
+    }
+
+    if (press_time >= WIFI_RESET_MIN_MS && press_time <= WIFI_RESET_MAX_MS) {
+      executeWiFiReset();
+    } else if (press_time <= SHORT_CLICK_MAX_MS) {
+      registerShortClick(now);
+    } else {
+      Serial.print("Pressionamento ignorado. Tempo pressionado: ");
+      Serial.print(press_time);
+      Serial.println(" ms.");
+      Serial.println("Use 3 a 4 segundos para Reset Wi-Fi ou cliques curtos para SoftAP/Factory Reset.");
+      clearClickSequence();
+    }
+  }
+
+  processClickSequenceIfReady(now);
+  last_button_state = current_state;
+}
+
+// ==============================
+// EVENTOS DO PROVISIONAMENTO
+// ==============================
+void sysProvEvent(arduino_event_t *sys_event) {
+  switch (sys_event->event_id) {
+    case ARDUINO_EVENT_PROV_START:
+      if (currentProvMode == PROV_MODE_BLE) {
+        Serial.printf("\nProvisioning Started with name \"%s\" and PoP \"%s\" on BLE\n", service_name, pop);
+      } else {
+        Serial.printf("\nProvisioning Started with name \"%s\", key \"%s\" and PoP \"%s\" on SoftAP\n",
+                      service_name, service_key, pop);
+      }
+
+      Serial.println("Scan this QR code from the provisioning application for Provisioning.");
+      WiFiProv.printQR(service_name, pop, getQrTransportName());
+
+      Serial.println();
+      Serial.println("=== DADOS DE RECUPERAÇÃO ===");
+      Serial.printf("Modo atual: %s\n", getProvModeName());
+      Serial.printf("Nome do dispositivo: %s\n", service_name);
+      Serial.printf("POP: %s\n", pop);
+      if (currentProvMode == PROV_MODE_SOFTAP) {
+        Serial.printf("Senha do SoftAP: %s\n", service_key);
+      }
+      Serial.println("============================");
+      break;
+
+    case ARDUINO_EVENT_PROV_INIT:
+      Serial.printf("Inicializando provisionamento %s...\n", getProvModeName());
+      WiFiProv.disableAutoStop(10000);
+      break;
+
+    case ARDUINO_EVENT_PROV_CRED_RECV:
+      Serial.println("Recebendo credenciais de Wi-Fi...");
+      break;
+
+    case ARDUINO_EVENT_PROV_CRED_SUCCESS:
+      Serial.println("Credenciais recebidas com sucesso.");
+      WiFiProv.endProvision();
+      if (currentProvMode == PROV_MODE_SOFTAP) {
+        Serial.println("Provisionamento em SoftAP concluído.");
+        Serial.println("No próximo boot o dispositivo voltará ao modo normal BLE.");
+        saveSoftAPOnce(false);
+      }
+      break;
+
+    case ARDUINO_EVENT_WIFI_STA_CONNECTED:
+      Serial.println("Conectado ao Wi-Fi.");
+      break;
+
+    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+      Serial.print("IP: ");
+      Serial.println(WiFi.localIP());
+      break;
+
+    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+      Serial.println("Wi-Fi desconectado.");
+      break;
+
+    default:
+      break;
+  }
+}
+
+// ==============================
+// CALLBACK DO APP (Ação do Relé)
+// ==============================
+void write_callback(Device *device, Param *param, const param_val_t val,
+                    void *priv_data, write_ctx_t *ctx) {
+  const char *param_name = param->getParamName();
+  
+  if (strcmp(param_name, "Power") == 0) {
+    bool new_state = val.val.b;
+    applyOutputsFromState(new_state);
+    
+    Serial.printf("App enviou Power: %s\n", switch_state ? "LIGADO" : "DESLIGADO");
+    param->updateAndReport(val);
+  }
+}
+
+// ==============================
+// ESCOLHA DO MODO DE BOOT
+// ==============================
+void selectProvisionModeAtBoot() {
+  bool softap_once = loadSoftAPOnce();
+  if (softap_once) {
+    currentProvMode = PROV_MODE_SOFTAP;
+    Serial.println("Modo temporário SoftAP carregado da memória.");
+  } else {
+    currentProvMode = PROV_MODE_BLE;
+    Serial.println("Modo normal BLE carregado.");
+  }
+}
+
+// ==============================
+// INICIA O PROVISIONAMENTO
+// ==============================
+void startProvisioning() {
+  WiFi.onEvent(sysProvEvent);
+  if (currentProvMode == PROV_MODE_BLE) {
+    WiFiProv.initProvision(NETWORK_PROV_SCHEME_BLE,
+                           NETWORK_PROV_SCHEME_HANDLER_FREE_BTDM);
+    RMaker.start();
+    WiFiProv.beginProvision(NETWORK_PROV_SCHEME_BLE,
+                            NETWORK_PROV_SCHEME_HANDLER_FREE_BTDM,
+                            NETWORK_PROV_SECURITY_1,
+                            pop,
+                            service_name);
+  } else {
+    WiFiProv.initProvision(NETWORK_PROV_SCHEME_SOFTAP,
+                           NETWORK_PROV_SCHEME_HANDLER_NONE);
+    RMaker.start();
+    WiFiProv.beginProvision(NETWORK_PROV_SCHEME_SOFTAP,
+                            NETWORK_PROV_SCHEME_HANDLER_NONE,
+                            NETWORK_PROV_SECURITY_1,
+                            pop,
+                            service_name,
+                            service_key);
+  }
+}
+
+// ==============================
+// SETUP
+// ==============================
+void setup() {
+  Serial.begin(115200);
+  delay(1500);
+
+  Serial.println();
+  Serial.println("Bootando ESP RainMaker - Relé Inteligente...");
+
+  // Pinos
+  pinMode(gpio_led, OUTPUT);
+  pinMode(gpio_button, INPUT_PULLUP);
+  
+  // OUTPUT normal para enviar os 3.3V para a base do Transistor NPN
+  pinMode(gpio_rele, OUTPUT);
+
+  // Estado inicial
+  applyOutputsFromState(switch_state);
+  last_button_state = digitalRead(gpio_button);
+
+  // Checa modo de provisionamento
+  selectProvisionModeAtBoot();
+
+  // Inicia RainMaker
+  Node my_node = RMaker.initNode("ESP32-C3 Rele");
+  
+  my_switch = new Switch("rele_esp", NULL, switch_state);
+  if (!my_switch) {
+    Serial.println("Erro ao criar switch RainMaker.");
+    return;
+  }
+
+  my_switch->addCb(write_callback);
+  my_node.addDevice(*my_switch);
+
+  startProvisioning();
+  
+  Serial.printf("RainMaker iniciado em modo %s.\n", getProvModeName());
+  Serial.println("Modo normal: BLE + QR.");
+  Serial.println("Recuperação sem QR: 3 cliques curtos + aguardar 1s = SoftAP temporário.");
+  Serial.println("Factory Reset: 5 a 7 cliques curtos + aguardar 1s.");
+  Serial.println("Reset Wi-Fi: Segurar botão BOOT entre 3 e 4 segundos.");
+  Serial.println("Relé atuando no GPIO4 (NPN/Active LOW) com OUTPUT_OPEN_DRAIN.");
+}
+
+// ==============================
+// LOOP
+// ==============================
+void loop() {
+  handleBootButton();
+  delay(10);
+}

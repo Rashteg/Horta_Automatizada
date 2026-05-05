@@ -1,0 +1,1244 @@
+// 2026-04-28 America/Sao_Paulo
+// ESP RainMaker - SENSOR DA HORTA
+// Completo: Interface original, Megafone UDP (Canais 1 a 10) e Função Name
+
+#include <Arduino.h>
+#include <math.h>
+#include "RMaker.h"
+#include "WiFi.h"
+#include "WiFiProv.h"
+#include <Preferences.h>
+#include "DHT.h"
+#include <WiFiUdp.h>
+
+// ==============================
+// CONFIGURAÇÕES DO DISPOSITIVO
+// ==============================
+const char *service_name = "PROV_C3_01";
+const char *pop = "12345678";
+const char *service_key = "12345678";
+
+// ESP32-C3 SuperMini
+static const int gpio_led = 8;
+static const int gpio_button = 9;
+
+// ==============================
+// CONFIGURAÇÕES UDP E CANAL (MEGAFONE)
+// ==============================
+WiFiUDP udp;
+const char * udpAddress = "255.255.255.255"; 
+const int udpPort = 8888;
+unsigned long last_udp_send_ms = 0;
+int canal_comunicacao = 1; // CANAL PADRÃO (1 a 10)
+
+// ==============================
+// ESTADO DO DISPOSITIVO
+// ==============================
+bool switch_state = true;
+bool saida_irrigacao_state = false;
+bool modo_automatico = true;
+bool comando_manual = false;
+
+static Device *my_horta = NULL;
+
+// ==============================
+// ATRASO PARA APLICAR CONFIGURAÇÕES
+// ==============================
+static const unsigned long CONFIG_APPLY_DELAY_MS = 1500;
+bool config_apply_pending = false;
+unsigned long config_apply_due_ms = 0;
+
+// ==============================
+// PEDIDOS INTERNOS DE IRRIGAÇÃO
+// ==============================
+bool pedido_irrigacao_solo = false;
+bool pedido_irrigacao_temperatura = false;
+
+// ==============================
+// CONFIGURAÇÕES DE IRRIGAÇÃO POR SOLO
+// ==============================
+int faixa_umidade_min = 0;
+int faixa_umidade_max = 30;
+bool irrigacao_da_faixa_solo = true;
+
+// ==============================
+// CONFIGURAÇÕES DE IRRIGAÇÃO POR TEMPERATURA
+// ==============================
+int faixa_temp_min = 32;
+int faixa_temp_max = 45;
+bool irrigacao_da_faixa_temp = true;
+int tempo_irrigacao_temp_min = 5;
+int tempo_pausa_temp_min = 15;
+
+// Limites
+static const int UMIDADE_MIN_LIMITE = 0;
+static const int UMIDADE_MAX_LIMITE = 100;
+static const int TEMP_MIN_LIMITE = 0;
+static const int TEMP_MAX_LIMITE = 80;
+static const int TEMPO_IRRIGACAO_MIN_LIMITE = 0;
+static const int TEMPO_IRRIGACAO_MAX_LIMITE = 60;
+static const int TEMPO_PAUSA_MIN_LIMITE = 0;
+static const int TEMPO_PAUSA_MAX_LIMITE = 120;
+
+// Últimas leituras
+static bool ultima_umidade_solo_lida_valida = false;
+static int ultima_umidade_solo_lida = 0;
+static bool ultima_temperatura_lida_valida = false;
+static float ultima_temperatura_lida = NAN;
+
+// Controle do ciclo temporizado da temperatura
+static bool temp_condicao_anterior = false;
+static bool temp_ciclo_ativo = false;
+static unsigned long temp_ciclo_fim_ms = 0;
+static bool temp_pausa_ativa = false;
+static unsigned long temp_pausa_fim_ms = 0;   
+
+// NVS / Preferences
+Preferences prefs;
+const char *PREF_NS = "dasrum_rm";
+const char *PREF_SOFTAP = "softap_once";
+
+// ==============================
+// DHT22
+// ==============================
+static const int DHTPIN = 4;
+#define DHTTYPE DHT22
+DHT dht(DHTPIN, DHTTYPE);
+float valorParaSubtrair = 0.0f;
+
+// ==============================
+// SENSOR DE UMIDADE DO SOLO
+// ==============================
+static const int PINO_SENSOR_SOLO = 1;
+static const int valorSeco = 3370;
+static const int valorMolhado = 1520;
+
+// ==============================
+// INTERVALOS DE LEITURA / ENVIO
+// ==============================
+static unsigned long last_sensor_read_ms = 0;
+static const unsigned long SENSOR_SLOT_INTERVAL_MS = 4000;
+static uint8_t sensor_etapa = 0;
+
+// ==============================
+// CONTROLE DE VARIAÇÃO PARA PUBLICAÇÃO
+// ==============================
+static const float DELTA_UMIDADE_SOLO = 10.0f;
+static const float DELTA_TEMPERATURA_AR = 0.2f;
+static const float DELTA_UMIDADE_AR = 10.0f;
+
+static float ultima_umidade_solo_publicada = NAN;
+static float ultima_temperatura_ar_publicada = NAN;
+static float ultima_umidade_ar_publicada = NAN;
+
+// Cache do DHT22
+static bool ultima_leitura_dht_valida = false;
+static float ultima_temperatura_dht = NAN;
+static float ultima_umidade_ar_dht = NAN;
+
+// ==============================
+// MODOS DE PROVISIONAMENTO
+// ==============================
+enum ProvisionMode {
+  PROV_MODE_BLE = 0,
+  PROV_MODE_SOFTAP = 1
+};
+ProvisionMode currentProvMode = PROV_MODE_BLE;
+
+// ==============================
+// CONTROLE DO BOTÃO BOOT
+// ==============================
+static bool last_button_state = HIGH;
+static unsigned long press_start_ms = 0;
+static uint8_t click_count = 0;
+static unsigned long sequence_start_ms = 0;
+static unsigned long last_click_ms = 0;
+
+static const unsigned long DEBOUNCE_MS = 40;
+static const unsigned long SHORT_CLICK_MAX_MS = 1200;
+static const unsigned long CLICK_DECISION_PAUSE_MS = 1000;
+static const unsigned long CLICK_SEQUENCE_MAX_MS = 6000;
+static const unsigned long WIFI_RESET_MIN_MS = 3000;
+static const unsigned long WIFI_RESET_MAX_MS = 4000;
+
+static const uint8_t SOFTAP_CLICKS = 3;
+static const uint8_t FACTORY_RESET_MIN_CLICKS = 5;
+static const uint8_t FACTORY_RESET_MAX_CLICKS = 7;
+
+// ==============================
+// MEMÓRIA NVS
+// ==============================
+void salvarPrefInt(const char* chave, int valor) {
+  prefs.begin(PREF_NS, false);
+  prefs.putInt(chave, valor);
+  prefs.end();
+}
+
+void salvarPrefBool(const char* chave, bool valor) {
+  prefs.begin(PREF_NS, false);
+  prefs.putBool(chave, valor);
+  prefs.end();
+}
+
+void carregarConfiguracoesNVS() {
+  prefs.begin(PREF_NS, true);
+  canal_comunicacao = prefs.getInt("canal_com", 1);
+  modo_automatico = prefs.getBool("modo_auto", true);
+  comando_manual = prefs.getBool("cmd_manual", false);
+  
+  faixa_umidade_min = prefs.getInt("f_umi_min", 0);
+  faixa_umidade_max = prefs.getInt("f_umi_max", 30);
+  irrigacao_da_faixa_solo = prefs.getBool("irr_f_solo", true);
+  
+  faixa_temp_min = prefs.getInt("f_tmp_min", 32);
+  faixa_temp_max = prefs.getInt("f_tmp_max", 45);
+  tempo_irrigacao_temp_min = prefs.getInt("t_irr_tmp", 5);
+  tempo_pausa_temp_min = prefs.getInt("t_pau_tmp", 15);
+  irrigacao_da_faixa_temp = prefs.getBool("irr_f_tmp", true);
+  prefs.end();
+  Serial.println("Configurações recuperadas da memória interna (NVS) com sucesso!");
+}
+
+// ==============================
+// MEGAFONE UDP: GRITA O ESTADO
+// ==============================
+void gritarStatusUDP() {
+  if (WiFi.status() == WL_CONNECTED) {
+    unsigned long now = millis();
+    // Grita na rede a cada 2 segundos
+    if (now - last_udp_send_ms > 2000) {
+      last_udp_send_ms = now;
+      udp.beginPacket(udpAddress, udpPort);
+      
+      // Monta a mensagem baseada no canal (Ex: "ZONA:1:ON")
+      String mensagem = "ZONA:" + String(canal_comunicacao) + (saida_irrigacao_state ? ":ON" : ":OFF");
+      udp.print(mensagem);
+      
+      udp.endPacket();
+    }
+  }
+}
+
+// ==============================
+// FUNÇÕES AUXILIARES
+// ==============================
+void setOnboardLed(bool on) {
+  digitalWrite(gpio_led, on ? LOW : HIGH);
+}
+
+const char *getProvModeName() {
+  return (currentProvMode == PROV_MODE_SOFTAP) ? "SoftAP" : "BLE";
+}
+
+const char *getQrTransportName() {
+  return (currentProvMode == PROV_MODE_SOFTAP) ? "softap" : "ble";
+}
+
+void saveSoftAPOnce(bool enable) {
+  salvarPrefBool(PREF_SOFTAP, enable);
+}
+
+bool loadSoftAPOnce() {
+  prefs.begin(PREF_NS, true);
+  bool value = prefs.getBool(PREF_SOFTAP, false);
+  prefs.end();
+  return value;
+}
+
+void clearClickSequence() {
+  click_count = 0;
+  sequence_start_ms = 0;
+  last_click_ms = 0;
+}
+
+void blinkFeedback(uint8_t times, unsigned long onMs, unsigned long offMs) {
+  bool previous_state = switch_state;
+  for (uint8_t i = 0; i < times; i++) {
+    setOnboardLed(true);
+    delay(onMs);
+    setOnboardLed(false);
+    delay(offMs);
+  }
+  setOnboardLed(previous_state);
+}
+
+// ==============================
+// SAÍDA FINAL DE IRRIGAÇÃO
+// ==============================
+void atualizarSaidaIrrigacao(bool novo_estado, const char *origem) {
+  bool mudou = (novo_estado != saida_irrigacao_state);
+  saida_irrigacao_state = novo_estado;
+
+  Serial.print("Saída Irrigação atualizada por ");
+  Serial.print(origem);
+  Serial.print(": ");
+  Serial.println(saida_irrigacao_state ? "ON" : "OFF");
+
+  Serial.print("Modo: ");
+  Serial.print(modo_automatico ? "AUTOMÁTICO" : "MANUAL");
+  Serial.print(" | Pedido Solo: ");
+  Serial.print(pedido_irrigacao_solo ? "SIM" : "NÃO");
+  Serial.print(" | Pedido Temperatura: ");
+  Serial.print(pedido_irrigacao_temperatura ? "SIM" : "NÃO");
+  Serial.print(" | Comando Manual: ");
+  Serial.println(comando_manual ? "ON" : "OFF");
+  
+  if (my_horta) {
+    my_horta->updateAndReportParam("Saída Irrigação", saida_irrigacao_state);
+  }
+
+  if (mudou) {
+    Serial.println("Estado final da irrigação mudou.");
+  }
+}
+
+void aplicarSaidaIrrigacaoFinal(const char *origem) {
+  if (modo_automatico) {
+    bool novo_estado = (pedido_irrigacao_solo || pedido_irrigacao_temperatura);
+    atualizarSaidaIrrigacao(novo_estado, origem);
+  } else {
+    atualizarSaidaIrrigacao(comando_manual, origem);
+  }
+}
+
+// ==============================
+// AGENDAMENTO DE APLICAÇÃO
+// ==============================
+void agendarAplicacaoConfiguracao(const char *origem) {
+  config_apply_pending = true;
+  config_apply_due_ms = millis() + CONFIG_APPLY_DELAY_MS;
+
+  Serial.print("Configuração alterada por ");
+  Serial.print(origem);
+  Serial.print(". Aplicação agendada para daqui ");
+  Serial.print(CONFIG_APPLY_DELAY_MS);
+  Serial.println(" ms.");
+}
+
+void corrigirConfiguracoesAtivas() {
+  int old_umidade_min = faixa_umidade_min;
+  int old_umidade_max = faixa_umidade_max;
+  int old_temp_min = faixa_temp_min;
+  int old_temp_max = faixa_temp_max;
+  int old_tempo_irrigacao = tempo_irrigacao_temp_min;
+  int old_tempo_pausa = tempo_pausa_temp_min;
+
+  if (faixa_umidade_min < UMIDADE_MIN_LIMITE) faixa_umidade_min = UMIDADE_MIN_LIMITE;
+  if (faixa_umidade_min > UMIDADE_MAX_LIMITE) faixa_umidade_min = UMIDADE_MAX_LIMITE;
+  if (faixa_umidade_max < UMIDADE_MIN_LIMITE) faixa_umidade_max = UMIDADE_MIN_LIMITE;
+  if (faixa_umidade_max > UMIDADE_MAX_LIMITE) faixa_umidade_max = UMIDADE_MAX_LIMITE;
+  if (faixa_umidade_min > faixa_umidade_max) {
+    faixa_umidade_max = faixa_umidade_min;
+  }
+
+  if (faixa_temp_min < TEMP_MIN_LIMITE) faixa_temp_min = TEMP_MIN_LIMITE;
+  if (faixa_temp_min > TEMP_MAX_LIMITE) faixa_temp_min = TEMP_MAX_LIMITE;
+  if (faixa_temp_max < TEMP_MIN_LIMITE) faixa_temp_max = TEMP_MIN_LIMITE;
+  if (faixa_temp_max > TEMP_MAX_LIMITE) faixa_temp_max = TEMP_MAX_LIMITE;
+  if (faixa_temp_min > faixa_temp_max) {
+    faixa_temp_max = faixa_temp_min;
+  }
+
+  if (tempo_irrigacao_temp_min < TEMPO_IRRIGACAO_MIN_LIMITE) {
+    tempo_irrigacao_temp_min = TEMPO_IRRIGACAO_MIN_LIMITE;
+  }
+  if (tempo_irrigacao_temp_min > TEMPO_IRRIGACAO_MAX_LIMITE) {
+    tempo_irrigacao_temp_min = TEMPO_IRRIGACAO_MAX_LIMITE;
+  }
+  if (tempo_pausa_temp_min < TEMPO_PAUSA_MIN_LIMITE) {
+    tempo_pausa_temp_min = TEMPO_PAUSA_MIN_LIMITE;
+  }
+  if (tempo_pausa_temp_min > TEMPO_PAUSA_MAX_LIMITE) {
+    tempo_pausa_temp_min = TEMPO_PAUSA_MAX_LIMITE;
+  }
+
+  if (my_horta) {
+    if (faixa_umidade_min != old_umidade_min) {
+        salvarPrefInt("f_umi_min", faixa_umidade_min);
+        my_horta->updateAndReportParam("Solo - Faixa Mínima (%)", faixa_umidade_min);
+    }
+    if (faixa_umidade_max != old_umidade_max) {
+        salvarPrefInt("f_umi_max", faixa_umidade_max);
+        my_horta->updateAndReportParam("Solo - Faixa Máxima (%)", faixa_umidade_max);
+    }
+    if (faixa_temp_min != old_temp_min) {
+        salvarPrefInt("f_tmp_min", faixa_temp_min);
+        my_horta->updateAndReportParam("Temp - Faixa Mínima (°C)", faixa_temp_min);
+    }
+    if (faixa_temp_max != old_temp_max) {
+        salvarPrefInt("f_tmp_max", faixa_temp_max);
+        my_horta->updateAndReportParam("Temp - Faixa Máxima (°C)", faixa_temp_max);
+    }
+    if (tempo_irrigacao_temp_min != old_tempo_irrigacao) {
+        salvarPrefInt("t_irr_tmp", tempo_irrigacao_temp_min);
+        my_horta->updateAndReportParam("Temp - Tempo Irrigação (min)", tempo_irrigacao_temp_min);
+    }
+    if (tempo_pausa_temp_min != old_tempo_pausa) {
+        salvarPrefInt("t_pau_tmp", tempo_pausa_temp_min);
+        my_horta->updateAndReportParam("Temp - Pausa Irrigação (min)", tempo_pausa_temp_min);
+    }
+  }
+}
+
+// ==============================
+// REGRAS DE IRRIGAÇÃO
+// ==============================
+bool temperaturaDentroDaFaixa(float temperatura) {
+  return (temperatura >= (float)faixa_temp_min && temperatura <= (float)faixa_temp_max);
+}
+
+void avaliarRegraIrrigacaoSolo(int umidadeSolo) {
+  ultima_umidade_solo_lida = umidadeSolo;
+  ultima_umidade_solo_lida_valida = true;
+
+  Serial.println();
+  Serial.println("Avaliando regra: Irrigação por Umidade do Solo");
+  Serial.print("Umidade do solo atual: ");
+  Serial.print(umidadeSolo);
+  Serial.println("%");
+  Serial.print("Solo - Faixa Mínima (%): ");
+  Serial.print(faixa_umidade_min);
+  Serial.println("%");
+  Serial.print("Solo - Faixa Máxima (%): ");
+  Serial.print(faixa_umidade_max);
+  Serial.println("%");
+  Serial.print("Solo - Irrigação da Faixa: ");
+  Serial.println(irrigacao_da_faixa_solo ? "ON" : "OFF");
+
+  if (irrigacao_da_faixa_solo && umidadeSolo >= faixa_umidade_min && umidadeSolo <= faixa_umidade_max) {
+    pedido_irrigacao_solo = true;
+  } else {
+    pedido_irrigacao_solo = false;
+  }
+
+  aplicarSaidaIrrigacaoFinal("regra de umidade do solo");
+  Serial.println("--------------------------------");
+}
+
+void avaliarRegraIrrigacaoTemperatura(float temperatura) {
+  ultima_temperatura_lida = temperatura;
+  ultima_temperatura_lida_valida = true;
+  bool dentro_da_faixa = temperaturaDentroDaFaixa(temperatura);
+
+  Serial.println();
+  Serial.println("Avaliando regra: Irrigação por Temperatura");
+  Serial.print("Temperatura atual: ");
+  Serial.print(temperatura);
+  Serial.println(" °C");
+  Serial.print("Temp - Faixa Mínima (°C): ");
+  Serial.print(faixa_temp_min);
+  Serial.println(" °C");
+  Serial.print("Temp - Faixa Máxima (°C): ");
+  Serial.print(faixa_temp_max);
+  Serial.println(" °C");
+  Serial.print("Temp - Irrigação da Faixa: ");
+  Serial.println(irrigacao_da_faixa_temp ? "ON" : "OFF");
+  Serial.print("Temp - Tempo Irrigação (min): ");
+  Serial.println(tempo_irrigacao_temp_min);
+  Serial.print("Temp - Pausa Irrigação (min): ");
+  Serial.println(tempo_pausa_temp_min);
+
+  if (!irrigacao_da_faixa_temp) {
+    pedido_irrigacao_temperatura = false;
+    temp_ciclo_ativo = false;
+    temp_pausa_ativa = false;
+    temp_ciclo_fim_ms = 0;
+    temp_pausa_fim_ms = 0;
+    temp_condicao_anterior = dentro_da_faixa;
+
+    aplicarSaidaIrrigacaoFinal("temperatura desabilitada");
+    Serial.println("--------------------------------");
+    return;
+  }
+
+  if (tempo_irrigacao_temp_min == 0) {
+    pedido_irrigacao_temperatura = dentro_da_faixa;
+    temp_ciclo_ativo = false;
+    temp_pausa_ativa = false;
+    temp_ciclo_fim_ms = 0;
+    temp_pausa_fim_ms = 0;
+    temp_condicao_anterior = dentro_da_faixa;
+
+    aplicarSaidaIrrigacaoFinal("temperatura contínua");
+    Serial.println("--------------------------------");
+    return;
+  }
+
+  // ABORTA O TIMER SE A FAIXA FOR MUDADA
+  if (!dentro_da_faixa && (temp_ciclo_ativo || temp_pausa_ativa)) {
+    Serial.println("Temperatura saiu da faixa. Abortando ciclos e pausas!");
+    temp_ciclo_ativo = false;
+    temp_pausa_ativa = false;
+    pedido_irrigacao_temperatura = false;
+    temp_ciclo_fim_ms = 0;
+    temp_pausa_fim_ms = 0;
+  }
+
+  // GATILHO INICIA A REGA
+  if (dentro_da_faixa && !temp_ciclo_ativo && !temp_pausa_ativa) {
+    unsigned long duracao_ms = (unsigned long)tempo_irrigacao_temp_min * 60000UL;
+    temp_ciclo_ativo = true;
+    temp_ciclo_fim_ms = millis() + duracao_ms;
+    pedido_irrigacao_temperatura = true;
+    Serial.println("Temperatura na faixa. Ciclo de irrigação iniciado!");
+  }
+
+  temp_condicao_anterior = dentro_da_faixa;
+  aplicarSaidaIrrigacaoFinal("regra de temperatura");
+  Serial.println("--------------------------------");
+}
+
+void reavaliarRegrasPorConfiguracao() {
+  Serial.println();
+  Serial.println("Aplicando configurações após atraso...");
+
+  corrigirConfiguracoesAtivas();
+  if (!irrigacao_da_faixa_solo) {
+    pedido_irrigacao_solo = false;
+    Serial.println("Solo - Irrigação da Faixa OFF: pedido de solo forçado para OFF.");
+  }
+
+  if (!irrigacao_da_faixa_temp) {
+    pedido_irrigacao_temperatura = false;
+    temp_ciclo_ativo = false;
+    temp_pausa_ativa = false;
+    temp_ciclo_fim_ms = 0;
+    temp_pausa_fim_ms = 0;
+    Serial.println("Temp - Irrigação da Faixa OFF: pedido de temperatura forçado para OFF.");
+  }
+
+  if (ultima_umidade_solo_lida_valida) {
+    avaliarRegraIrrigacaoSolo(ultima_umidade_solo_lida);
+  }
+
+  if (ultima_temperatura_lida_valida && !isnan(ultima_temperatura_lida)) {
+    avaliarRegraIrrigacaoTemperatura(ultima_temperatura_lida);
+  }
+
+  if (!ultima_umidade_solo_lida_valida && !ultima_temperatura_lida_valida) {
+    aplicarSaidaIrrigacaoFinal("configuração aplicada sem leituras válidas");
+  }
+}
+
+void handleAplicarConfiguracoesPendentes() {
+  if (!config_apply_pending) return;
+
+  unsigned long now = millis();
+  if ((long)(now - config_apply_due_ms) >= 0) {
+    config_apply_pending = false;
+    reavaliarRegrasPorConfiguracao();
+  }
+}
+
+// ==============================
+// TIMER TEMPERATURA
+// ==============================
+void handleTimerTemperatura() {
+  unsigned long now = millis();
+  // Verifica se está regando e o tempo acabou
+  if (temp_ciclo_ativo && (long)(now - temp_ciclo_fim_ms) >= 0) {
+    temp_ciclo_ativo = false;
+    pedido_irrigacao_temperatura = false;
+    temp_ciclo_fim_ms = 0;
+
+    Serial.println("Tempo de irrigação por temperatura finalizado.");
+    if (tempo_pausa_temp_min > 0) {
+      temp_pausa_ativa = true;
+      temp_pausa_fim_ms = now + ((unsigned long)tempo_pausa_temp_min * 60000UL);
+      Serial.println("Iniciando tempo de pausa da irrigação por temperatura...");
+      aplicarSaidaIrrigacaoFinal("início da pausa de temperatura");
+    } else {
+      aplicarSaidaIrrigacaoFinal("fim do tempo de temperatura (sem pausa configurada)");
+    }
+  }
+
+  // Verifica se está na pausa e o tempo acabou
+  if (temp_pausa_ativa && (long)(now - temp_pausa_fim_ms) >= 0) {
+    temp_pausa_ativa = false;
+    temp_pausa_fim_ms = 0;
+    Serial.println("Fim do tempo de pausa. Sensores vão avaliar se precisa regar novamente.");
+  }
+}
+
+// ==============================
+// RESET / RECUPERAÇÃO
+// ==============================
+void rebootToSoftAPRecovery(uint8_t totalClicks) {
+  Serial.printf("Sequencia válida: %u cliques detectados.\n", totalClicks);
+  Serial.println("Entrando em modo temporário SoftAP...");
+  blinkFeedback(2, 150, 150);
+  saveSoftAPOnce(true);
+  delay(300);
+  ESP.restart();
+}
+
+void executeWiFiReset() {
+  Serial.println("Botão: Reset Wi-Fi.");
+  Serial.println("Apagando somente as credenciais de Wi-Fi salvas.");
+  blinkFeedback(3, 150, 150);
+  clearClickSequence();
+  delay(300);
+  RMakerWiFiReset(2);
+}
+
+void executeFactoryResetByClicks(uint8_t totalClicks) {
+  Serial.printf("Sequência válida: %u cliques detectados.\n", totalClicks);
+  Serial.println("Botão: Factory Reset.");
+  Serial.println("Apagando configurações do RainMaker/provisionamento. Firmware permanece gravado.");
+  blinkFeedback(5, 150, 150);
+  clearClickSequence();
+  delay(300);
+  RMakerFactoryReset(2);
+}
+
+void registerShortClick(unsigned long now) {
+  if (click_count == 0) {
+    click_count = 1;
+    sequence_start_ms = now;
+    last_click_ms = now;
+  } else {
+    if ((now - sequence_start_ms) > CLICK_SEQUENCE_MAX_MS) {
+      Serial.println("Tempo máximo da sequência excedido. Reiniciando contagem de cliques.");
+      click_count = 1;
+      sequence_start_ms = now;
+      last_click_ms = now;
+    } else {
+      click_count++;
+      last_click_ms = now;
+    }
+  }
+  Serial.printf("Clique curto %u detectado. Aguardando pausa de 1 segundo para decidir...\n", click_count);
+  if (click_count > FACTORY_RESET_MAX_CLICKS) {
+    Serial.println("Mais de 7 cliques detectados. Sequência ignorada para evitar reset acidental.");
+    clearClickSequence();
+  }
+}
+
+void processClickSequenceIfReady(unsigned long now) {
+  if (click_count == 0) return;
+  if ((now - last_click_ms) < CLICK_DECISION_PAUSE_MS) return;
+
+  uint8_t totalClicks = click_count;
+  clearClickSequence();
+  if (totalClicks == SOFTAP_CLICKS) {
+    rebootToSoftAPRecovery(totalClicks);
+    return;
+  }
+  if (totalClicks >= FACTORY_RESET_MIN_CLICKS && totalClicks <= FACTORY_RESET_MAX_CLICKS) {
+    executeFactoryResetByClicks(totalClicks);
+    return;
+  }
+  Serial.printf("Sequência de %u cliques ignorada.\n", totalClicks);
+  Serial.println("Use 3 cliques para SoftAP ou 5 a 7 cliques para Factory Reset.");
+}
+
+// ==============================
+// DIAGNÓSTICO DE PUBLICAÇÃO
+// ==============================
+float diferencaAbsoluta(float valorAtual, float ultimoValorPublicado) {
+  float diferenca = valorAtual - ultimoValorPublicado;
+  if (diferenca < 0) diferenca = -diferenca;
+  return diferenca;
+}
+
+bool devePublicarValor(const char *nomeParametro, float valorAtual, float ultimoValorPublicado, float limite) {
+  Serial.print("Diagnóstico ");
+  Serial.print(nomeParametro);
+  Serial.print(" -> Atual: ");
+  Serial.print(valorAtual);
+  if (isnan(ultimoValorPublicado)) {
+    Serial.print(" | Último publicado: N/A");
+    Serial.print(" | Limite: ");
+    Serial.print(limite);
+    Serial.println(" | Vai publicar: SIM - primeira publicação");
+    return true;
+  }
+  float diferenca = diferencaAbsoluta(valorAtual, ultimoValorPublicado);
+  Serial.print(" | Último publicado: ");
+  Serial.print(ultimoValorPublicado);
+  Serial.print(" | Diferença: ");
+  Serial.print(diferenca);
+  Serial.print(" | Limite: ");
+  Serial.print(limite);
+  if (diferenca >= limite) {
+    Serial.println(" | Vai publicar: SIM");
+    return true;
+  }
+  Serial.println(" | Vai publicar: NÃO");
+  return false;
+}
+
+// ==============================
+// SENSOR DE SOLO
+// ==============================
+int lerMediaSensorSolo(int amostras) {
+  long soma = 0;
+  for (int i = 0; i < amostras; i++) {
+    soma += analogRead(PINO_SENSOR_SOLO);
+    delay(10);
+  }
+  return soma / amostras;
+}
+
+int calcularUmidadePercentual(int valorLido, int seco, int molhado) {
+  int percentual = map(valorLido, seco, molhado, 0, 100);
+  if (percentual < 0) percentual = 0;
+  if (percentual > 100) percentual = 100;
+  return percentual;
+}
+
+const char* faixaUmidadeBruta(int valorBruto) {
+  if (valorBruto <= 3370 && valorBruto >= 2908) return "MUITO SECO";
+  if (valorBruto <= 2907 && valorBruto >= 2445) return "SECO";
+  if (valorBruto <= 2444 && valorBruto >= 1983) return "UMIDADE MÉDIA";
+  if (valorBruto <= 1982 && valorBruto >= 1520) return "MUITO ÚMIDO";
+  if (valorBruto > 3370) return "ACIMA DA FAIXA CALIBRADA";
+  if (valorBruto < 1520) return "ABAIXO DA FAIXA CALIBRADA";
+  return "FAIXA INDEFINIDA";
+}
+
+// ==============================
+// EVENTOS DO PROVISIONAMENTO
+// ==============================
+void sysProvEvent(arduino_event_t *sys_event) {
+  switch (sys_event->event_id) {
+    case ARDUINO_EVENT_PROV_START:
+      if (currentProvMode == PROV_MODE_BLE) {
+        Serial.printf("\nProvisioning Started with name \"%s\" and PoP \"%s\" on BLE\n", service_name, pop);
+      } else {
+        Serial.printf("\nProvisioning Started with name \"%s\", key \"%s\" and PoP \"%s\" on SoftAP\n", service_name, service_key, pop);
+      }
+      Serial.println("Scan this QR code from the provisioning application for Provisioning.");
+      WiFiProv.printQR(service_name, pop, getQrTransportName());
+      Serial.println();
+      Serial.println("=== DADOS DE RECUPERAÇÃO ===");
+      Serial.printf("Modo atual: %s\n", getProvModeName());
+      Serial.printf("Nome do dispositivo: %s\n", service_name);
+      Serial.printf("POP: %s\n", pop);
+      if (currentProvMode == PROV_MODE_SOFTAP) {
+        Serial.printf("Senha do SoftAP: %s\n", service_key);
+      }
+      Serial.println("============================");
+      break;
+    case ARDUINO_EVENT_PROV_INIT:
+      Serial.printf("Inicializando provisionamento %s...\n", getProvModeName());
+      WiFiProv.disableAutoStop(10000);
+      break;
+    case ARDUINO_EVENT_PROV_CRED_RECV:
+      Serial.println("Recebendo credenciais de Wi-Fi...");
+      break;
+    case ARDUINO_EVENT_PROV_CRED_SUCCESS:
+      Serial.println("Credenciais recebidas com sucesso.");
+      WiFiProv.endProvision();
+      if (currentProvMode == PROV_MODE_SOFTAP) {
+        Serial.println("Provisionamento em SoftAP concluído.");
+        Serial.println("No próximo boot o dispositivo voltará ao modo normal BLE.");
+        saveSoftAPOnce(false);
+      }
+      break;
+    case ARDUINO_EVENT_WIFI_STA_CONNECTED:
+      Serial.println("Conectado ao Wi-Fi.");
+      break;
+    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+      Serial.print("IP: ");
+      Serial.println(WiFi.localIP());
+      break;
+    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+      Serial.println("Wi-Fi desconectado.");
+      break;
+    default:
+      break;
+  }
+}
+
+// ==============================
+// CALLBACK DO APP
+// ==============================
+void write_callback(Device *device, Param *param, const param_val_t val,
+                    void *priv_data, write_ctx_t *ctx) {
+  const char *param_name = param->getParamName();
+
+  // === CALLBACK DO CANAL DE COMUNICAÇÃO ===
+  if (strcmp(param_name, "Canal de Comunicação") == 0) { 
+    canal_comunicacao = val.val.i; 
+    salvarPrefInt("canal_com", canal_comunicacao); 
+    param->updateAndReport(value(canal_comunicacao)); 
+    Serial.printf("Canal UDP alterado para: %d\n", canal_comunicacao);
+    return; 
+  }
+
+  if (strcmp(param_name, "Modo Automático") == 0) {
+    modo_automatico = val.val.b;
+    salvarPrefBool("modo_auto", modo_automatico);
+    Serial.print("App alterou Modo Automático: ");
+    Serial.println(modo_automatico ? "ON" : "OFF / MANUAL");
+    param->updateAndReport(value(modo_automatico));
+    aplicarSaidaIrrigacaoFinal("alteração do modo automático/manual");
+    return;
+  }
+
+  if (strcmp(param_name, "Comando Manual") == 0) {
+    comando_manual = val.val.b;
+    salvarPrefBool("cmd_manual", comando_manual);
+    Serial.print("App alterou Comando Manual: ");
+    Serial.println(comando_manual ? "ON" : "OFF");
+    param->updateAndReport(value(comando_manual));
+    if (modo_automatico) {
+      Serial.println("Modo Automático está ON. Comando Manual será ignorado pela saída.");
+      aplicarSaidaIrrigacaoFinal("comando manual ignorado em modo automático");
+    } else {
+      saida_irrigacao_state = comando_manual;
+      if (my_horta) {
+        my_horta->updateAndReportParam("Saída Irrigação", saida_irrigacao_state);
+      }
+      aplicarSaidaIrrigacaoFinal("comando manual em modo manual");
+    }
+    return;
+  }
+
+  // ------------------------------
+  // CONFIGURAÇÕES - SOLO
+  // ------------------------------
+  if (strcmp(param_name, "Solo - Faixa Mínima (%)") == 0) {
+    faixa_umidade_min = val.val.i;
+    salvarPrefInt("f_umi_min", faixa_umidade_min);
+    Serial.print("App alterou Solo - Faixa Mínima (%): ");
+    Serial.print(faixa_umidade_min);
+    Serial.println("%");
+    param->updateAndReport(value(faixa_umidade_min));
+    agendarAplicacaoConfiguracao("Solo - Faixa Mínima");
+    return;
+  }
+
+  if (strcmp(param_name, "Solo - Faixa Máxima (%)") == 0) {
+    faixa_umidade_max = val.val.i;
+    salvarPrefInt("f_umi_max", faixa_umidade_max);
+    Serial.print("App alterou Solo - Faixa Máxima (%): ");
+    Serial.print(faixa_umidade_max);
+    Serial.println("%");
+    param->updateAndReport(value(faixa_umidade_max));
+    agendarAplicacaoConfiguracao("Solo - Faixa Máxima");
+    return;
+  }
+
+  if (strcmp(param_name, "Solo - Irrigação da Faixa") == 0) {
+    irrigacao_da_faixa_solo = val.val.b;
+    salvarPrefBool("irr_f_solo", irrigacao_da_faixa_solo);
+    Serial.print("App alterou Solo - Irrigação da Faixa: ");
+    Serial.println(irrigacao_da_faixa_solo ? "ON" : "OFF");
+    param->updateAndReport(value(irrigacao_da_faixa_solo));
+    if (!irrigacao_da_faixa_solo) {
+      pedido_irrigacao_solo = false;
+      Serial.println("Solo - Irrigação da Faixa OFF: pedido de solo forçado para OFF.");
+      aplicarSaidaIrrigacaoFinal("solo desligado pelo usuário");
+    }
+    agendarAplicacaoConfiguracao("Solo - Irrigação da Faixa");
+    return;
+  }
+
+  // ------------------------------
+  // CONFIGURAÇÕES - TEMPERATURA
+  // ------------------------------
+  if (strcmp(param_name, "Temp - Faixa Mínima (°C)") == 0) {
+    faixa_temp_min = val.val.i;
+    salvarPrefInt("f_tmp_min", faixa_temp_min);
+    Serial.print("App alterou Temp - Faixa Mínima (°C): ");
+    Serial.print(faixa_temp_min);
+    Serial.println(" °C");
+    param->updateAndReport(value(faixa_temp_min));
+    agendarAplicacaoConfiguracao("Temp - Faixa Mínima");
+    return;
+  }
+
+  if (strcmp(param_name, "Temp - Faixa Máxima (°C)") == 0) {
+    faixa_temp_max = val.val.i;
+    salvarPrefInt("f_tmp_max", faixa_temp_max);
+    Serial.print("App alterou Temp - Faixa Máxima (°C): ");
+    Serial.print(faixa_temp_max);
+    Serial.println(" °C");
+    param->updateAndReport(value(faixa_temp_max));
+    agendarAplicacaoConfiguracao("Temp - Faixa Máxima");
+    return;
+  }
+
+  if (strcmp(param_name, "Temp - Irrigação da Faixa") == 0) {
+    irrigacao_da_faixa_temp = val.val.b;
+    salvarPrefBool("irr_f_tmp", irrigacao_da_faixa_temp);
+    Serial.print("App alterou Temp - Irrigação da Faixa: ");
+    Serial.println(irrigacao_da_faixa_temp ? "ON" : "OFF");
+    param->updateAndReport(value(irrigacao_da_faixa_temp));
+    if (!irrigacao_da_faixa_temp) {
+      pedido_irrigacao_temperatura = false;
+      temp_ciclo_ativo = false;
+      temp_pausa_ativa = false;
+      temp_ciclo_fim_ms = 0;
+      temp_pausa_fim_ms = 0;
+      Serial.println("Temp - Irrigação da Faixa OFF: pedido de temperatura e ciclo forçados para OFF.");
+      aplicarSaidaIrrigacaoFinal("temperatura desligada pelo usuário");
+    }
+    agendarAplicacaoConfiguracao("Temp - Irrigação da Faixa");
+    return;
+  }
+
+  if (strcmp(param_name, "Temp - Tempo Irrigação (min)") == 0) {
+    tempo_irrigacao_temp_min = val.val.i;
+    salvarPrefInt("t_irr_tmp", tempo_irrigacao_temp_min);
+    Serial.print("App alterou Temp - Tempo Irrigação: ");
+    Serial.print(tempo_irrigacao_temp_min);
+    Serial.println(" min");
+    param->updateAndReport(value(tempo_irrigacao_temp_min));
+    agendarAplicacaoConfiguracao("Temp - Tempo Irrigação");
+    return;
+  }
+
+  if (strcmp(param_name, "Temp - Pausa Irrigação (min)") == 0) {
+    tempo_pausa_temp_min = val.val.i;
+    salvarPrefInt("t_pau_tmp", tempo_pausa_temp_min);
+    Serial.print("App alterou Temp - Pausa Irrigação: ");
+    Serial.print(tempo_pausa_temp_min);
+    Serial.println(" min");
+    param->updateAndReport(value(tempo_pausa_temp_min));
+    agendarAplicacaoConfiguracao("Temp - Pausa Irrigação");
+    return;
+  }
+}
+
+// ==============================
+// ESCOLHA DO MODO DE BOOT
+// ==============================
+void selectProvisionModeAtBoot() {
+  bool softap_once = loadSoftAPOnce();
+  if (softap_once) {
+    currentProvMode = PROV_MODE_SOFTAP;
+    Serial.println("Modo temporário SoftAP carregado da memória.");
+  } else {
+    currentProvMode = PROV_MODE_BLE;
+    Serial.println("Modo normal BLE carregado.");
+  }
+}
+
+// ==============================
+// INICIA O PROVISIONAMENTO
+// ==============================
+void startProvisioning() {
+  WiFi.onEvent(sysProvEvent);
+  if (currentProvMode == PROV_MODE_BLE) {
+    WiFiProv.initProvision(NETWORK_PROV_SCHEME_BLE, NETWORK_PROV_SCHEME_HANDLER_FREE_BTDM);
+    RMaker.start();
+    WiFiProv.beginProvision(NETWORK_PROV_SCHEME_BLE, NETWORK_PROV_SCHEME_HANDLER_FREE_BTDM, NETWORK_PROV_SECURITY_1, pop, service_name);
+  } else {
+    WiFiProv.initProvision(NETWORK_PROV_SCHEME_SOFTAP, NETWORK_PROV_SCHEME_HANDLER_NONE);
+    RMaker.start();
+    WiFiProv.beginProvision(NETWORK_PROV_SCHEME_SOFTAP, NETWORK_PROV_SCHEME_HANDLER_NONE, NETWORK_PROV_SECURITY_1, pop, service_name, service_key);
+  }
+}
+
+// ==============================
+// TRATAMENTO DO BOTÃO BOOT
+// ==============================
+void handleBootButton() {
+  bool current_state = digitalRead(gpio_button);
+  unsigned long now = millis();
+  if (last_button_state == HIGH && current_state == LOW) {
+    press_start_ms = now;
+  }
+  if (last_button_state == LOW && current_state == HIGH) {
+    unsigned long press_time = now - press_start_ms;
+    if (press_time < DEBOUNCE_MS) {
+      last_button_state = current_state;
+      return;
+    }
+    if (press_time >= WIFI_RESET_MIN_MS && press_time <= WIFI_RESET_MAX_MS) {
+      executeWiFiReset();
+    } else if (press_time <= SHORT_CLICK_MAX_MS) {
+      registerShortClick(now);
+    } else {
+      Serial.print("Pressionamento ignorado. Tempo pressionado: ");
+      Serial.print(press_time);
+      Serial.println(" ms.");
+      Serial.println("Use 3 a 4 segundos para Reset Wi-Fi ou cliques curtos para SoftAP/Factory Reset.");
+      clearClickSequence();
+    }
+  }
+  processClickSequenceIfReady(now);
+  last_button_state = current_state;
+}
+
+// ==============================
+// LEITURA E PUBLICAÇÃO DOS SENSORES
+// ==============================
+void handleSensors() {
+  unsigned long now = millis();
+  if ((now - last_sensor_read_ms) < SENSOR_SLOT_INTERVAL_MS) {
+    return;
+  }
+  last_sensor_read_ms = now;
+
+  // ==================================================
+  // ETAPA 0 -> UMIDADE DO SOLO
+  // ==================================================
+  if (sensor_etapa == 0) {
+    int valorBrutoSolo = lerMediaSensorSolo(10);
+    int umidadeSolo = calcularUmidadePercentual(valorBrutoSolo, valorSeco, valorMolhado);
+    const char* faixaSolo = faixaUmidadeBruta(valorBrutoSolo);
+
+    Serial.println("Etapa 0/2 -> Umidade do Solo");
+    Serial.print("Solo -> Valor bruto: "); Serial.print(valorBrutoSolo);
+    Serial.print(" | Umidade estimada: "); Serial.print(umidadeSolo);
+    Serial.print("% | Faixa: "); Serial.println(faixaSolo);
+    if (my_horta) {
+      if (devePublicarValor("Umidade do Solo", (float)umidadeSolo, ultima_umidade_solo_publicada, DELTA_UMIDADE_SOLO)) {
+        my_horta->updateAndReportParam("Umidade do Solo", (float)umidadeSolo);
+        ultima_umidade_solo_publicada = (float)umidadeSolo;
+        Serial.println("Publicado: Umidade do Solo");
+      } else {
+        Serial.println("Não publicado: Umidade do Solo");
+      }
+    }
+    avaliarRegraIrrigacaoSolo(umidadeSolo);
+    sensor_etapa = 1;
+    Serial.println("--------------------------------");
+    return;
+  }
+
+  // ==================================================
+  // ETAPA 1 -> TEMPERATURA DO AR
+  // ==================================================
+  if (sensor_etapa == 1) {
+    float umidadeAr = dht.readHumidity();
+    float temperaturaBruta = dht.readTemperature();
+
+    Serial.println("Etapa 1/2 -> DHT22 + Temperatura do Ar");
+    if (isnan(umidadeAr) || isnan(temperaturaBruta)) {
+      ultima_leitura_dht_valida = false;
+      Serial.println("Falha ao ler o sensor DHT22! Verifique as conexões.");
+    } else {
+      float temperaturaFinal = temperaturaBruta - valorParaSubtrair;
+      ultima_temperatura_dht = temperaturaFinal;
+      ultima_umidade_ar_dht = umidadeAr;
+      ultima_leitura_dht_valida = true;
+
+      Serial.print("Temp. Original: "); Serial.print(temperaturaBruta);
+      Serial.print(" *C | Temp. Compensada: "); Serial.print(temperaturaFinal);
+      Serial.print(" *C | Umidade do Ar: "); Serial.print(umidadeAr); Serial.println(" %");
+      if (my_horta) {
+        if (devePublicarValor("Temperatura do Ar", temperaturaFinal, ultima_temperatura_ar_publicada, DELTA_TEMPERATURA_AR)) {
+          my_horta->updateAndReportParam("Temperatura", temperaturaFinal);
+          ultima_temperatura_ar_publicada = temperaturaFinal;
+          Serial.println("Publicado: Temperatura do Ar");
+        } else {
+          Serial.println("Não publicado: Temperatura do Ar");
+        }
+      }
+      avaliarRegraIrrigacaoTemperatura(temperaturaFinal);
+    }
+    sensor_etapa = 2;
+    Serial.println("--------------------------------");
+    return;
+  }
+
+  // ==================================================
+  // ETAPA 2 -> UMIDADE DO AR
+  // ==================================================
+  if (sensor_etapa == 2) {
+    Serial.println("Etapa 2/2 -> Umidade do Ar usando última leitura do DHT22");
+    if (!ultima_leitura_dht_valida || isnan(ultima_umidade_ar_dht)) {
+      Serial.println("Sem leitura válida recente do DHT22. Umidade do Ar não publicada.");
+    } else {
+      Serial.print("Umidade do Ar em cache: "); Serial.print(ultima_umidade_ar_dht); Serial.println(" %");
+      if (my_horta) {
+        if (devePublicarValor("Umidade do Ar", ultima_umidade_ar_dht, ultima_umidade_ar_publicada, DELTA_UMIDADE_AR)) {
+          my_horta->updateAndReportParam("Umidade do Ar", ultima_umidade_ar_dht);
+          ultima_umidade_ar_publicada = ultima_umidade_ar_dht;
+          Serial.println("Publicado: Umidade do Ar");
+        } else {
+          Serial.println("Não publicado: Umidade do Ar");
+        }
+      }
+    }
+    sensor_etapa = 0;
+    Serial.println("Ciclo completo dos sensores: Solo -> Temperatura -> Umidade do Ar");
+    Serial.println("--------------------------------");
+    return;
+  }
+  sensor_etapa = 0;
+}
+
+// ==============================
+// SETUP
+// ==============================
+void setup() {
+  Serial.begin(115200);
+  delay(1500);
+
+  Serial.println();
+  Serial.println("Bootando ESP RainMaker...");
+
+  // LÊ A MEMÓRIA ANTES DE CRIAR OS BOTÕES
+  carregarConfiguracoesNVS();
+
+  pinMode(gpio_led, OUTPUT);
+  setOnboardLed(switch_state);
+
+  pinMode(gpio_button, INPUT_PULLUP);
+  last_button_state = digitalRead(gpio_button);
+
+  analogReadResolution(12);
+  dht.begin();
+
+  Serial.println("Sensor de umidade do solo no ESP32-C3");
+  Serial.println("Faixas brutas:");
+  Serial.println("3370 até 2908 -> MUITO SECO");
+  Serial.println("2907 até 2445 -> SECO");
+  Serial.println("2444 até 1983 -> UMIDADE MÉDIA");
+  Serial.println("1982 até 1520 -> MUITO ÚMIDO");
+  Serial.println("--------------------------------");
+
+  selectProvisionModeAtBoot();
+  Node my_node = RMaker.initNode("ESP32-C3 Inteligente");
+
+  my_horta = new Device("Horta Inteligente", NULL, NULL);
+  if (!my_horta) {
+    Serial.println("Erro ao criar device Horta Inteligente.");
+    return;
+  }
+
+  // ---> ADICIONANDO O PARÂMETRO "NAME" <---
+  my_horta->addNameParam("Sensor Horta");
+
+  // ==============================
+  // CONTROLE DA IRRIGAÇÃO E ZONA
+  // ==============================
+  Param titulo_controle_irrigacao_param("🚿 Controle da Irrigação", NULL, value(""), PROP_FLAG_READ);
+  titulo_controle_irrigacao_param.addUIType(ESP_RMAKER_UI_TEXT);
+  my_horta->addParam(titulo_controle_irrigacao_param);
+
+  // ---> SLIDER DE PAREAMENTO (ZONA) <---
+  Param canal_param("Canal de Comunicação", NULL, value(canal_comunicacao), PROP_FLAG_READ | PROP_FLAG_WRITE | PROP_FLAG_PERSIST); 
+  canal_param.addUIType(ESP_RMAKER_UI_SLIDER); 
+  canal_param.addBounds(value(1), value(10), value(1)); // Permite selecionar a zona de 1 a 10
+  my_horta->addParam(canal_param);
+
+  Param modo_automatico_param("Modo Automático", NULL, value(modo_automatico),
+                              PROP_FLAG_READ | PROP_FLAG_WRITE | PROP_FLAG_PERSIST);
+  modo_automatico_param.addUIType(ESP_RMAKER_UI_TOGGLE);
+  my_horta->addParam(modo_automatico_param);
+
+  Param comando_manual_param("Comando Manual", NULL, value(comando_manual),
+                             PROP_FLAG_READ | PROP_FLAG_WRITE | PROP_FLAG_PERSIST);
+  comando_manual_param.addUIType(ESP_RMAKER_UI_TOGGLE);
+  my_horta->addParam(comando_manual_param);
+
+  Param saida_irrigacao_param("Saída Irrigação", NULL, value(saida_irrigacao_state),
+                              PROP_FLAG_READ);
+  saida_irrigacao_param.addUIType(ESP_RMAKER_UI_TOGGLE);
+  my_horta->addParam(saida_irrigacao_param);
+
+  // ==============================
+  // SENSORES DA HORTA
+  // ==============================
+  Param titulo_sensores_param("📊 Sensores da Horta", NULL, value(""), PROP_FLAG_READ);
+  titulo_sensores_param.addUIType(ESP_RMAKER_UI_TEXT);
+  my_horta->addParam(titulo_sensores_param);
+
+  Param temperature_param("Temperatura", "esp.param.temperature", value(0.0f),
+                          PROP_FLAG_READ | PROP_FLAG_TIME_SERIES);
+  my_horta->addParam(temperature_param);
+
+  Param air_humidity_param("Umidade do Ar", "esp.param.humidity", value(0.0f),
+                           PROP_FLAG_READ | PROP_FLAG_TIME_SERIES);
+  my_horta->addParam(air_humidity_param);
+
+  Param soil_humidity_param("Umidade do Solo", "esp.param.humidity", value(0.0f),
+                            PROP_FLAG_READ | PROP_FLAG_TIME_SERIES);
+  soil_humidity_param.addBounds(value(0.0f), value(100.0f), value(1.0f));
+  my_horta->addParam(soil_humidity_param);
+
+  // ==============================
+  // IRRIGAÇÃO POR UMIDADE DO SOLO
+  // ==============================
+  Param titulo_irrigacao_solo_param("💧 Irrigação por Umidade do Solo", NULL, value(""), PROP_FLAG_READ);
+  titulo_irrigacao_solo_param.addUIType(ESP_RMAKER_UI_TEXT);
+  my_horta->addParam(titulo_irrigacao_solo_param);
+
+  Param faixa_min_solo_param("Solo - Faixa Mínima (%)", NULL, value(faixa_umidade_min),
+                             PROP_FLAG_READ | PROP_FLAG_WRITE | PROP_FLAG_PERSIST);
+  faixa_min_solo_param.addUIType(ESP_RMAKER_UI_SLIDER);
+  faixa_min_solo_param.addBounds(value(UMIDADE_MIN_LIMITE), value(UMIDADE_MAX_LIMITE), value(1));
+  my_horta->addParam(faixa_min_solo_param);
+
+  Param faixa_max_solo_param("Solo - Faixa Máxima (%)", NULL, value(faixa_umidade_max),
+                             PROP_FLAG_READ | PROP_FLAG_WRITE | PROP_FLAG_PERSIST);
+  faixa_max_solo_param.addUIType(ESP_RMAKER_UI_SLIDER);
+  faixa_max_solo_param.addBounds(value(UMIDADE_MIN_LIMITE), value(UMIDADE_MAX_LIMITE), value(1));
+  my_horta->addParam(faixa_max_solo_param);
+
+  Param irrigacao_faixa_solo_param("Solo - Irrigação da Faixa", NULL, value(irrigacao_da_faixa_solo),
+                                   PROP_FLAG_READ | PROP_FLAG_WRITE | PROP_FLAG_PERSIST);
+  irrigacao_faixa_solo_param.addUIType(ESP_RMAKER_UI_TOGGLE);
+  my_horta->addParam(irrigacao_faixa_solo_param);
+
+  // ==============================
+  // IRRIGAÇÃO POR TEMPERATURA
+  // ==============================
+  Param titulo_irrigacao_temp_param("🌡️ Irrigação por Temperatura", NULL, value(""), PROP_FLAG_READ);
+  titulo_irrigacao_temp_param.addUIType(ESP_RMAKER_UI_TEXT);
+  my_horta->addParam(titulo_irrigacao_temp_param);
+
+  Param faixa_min_temp_param("Temp - Faixa Mínima (°C)", NULL, value(faixa_temp_min),
+                             PROP_FLAG_READ | PROP_FLAG_WRITE | PROP_FLAG_PERSIST);
+  faixa_min_temp_param.addUIType(ESP_RMAKER_UI_SLIDER);
+  faixa_min_temp_param.addBounds(value(TEMP_MIN_LIMITE), value(TEMP_MAX_LIMITE), value(1));
+  my_horta->addParam(faixa_min_temp_param);
+
+  Param faixa_max_temp_param("Temp - Faixa Máxima (°C)", NULL, value(faixa_temp_max),
+                             PROP_FLAG_READ | PROP_FLAG_WRITE | PROP_FLAG_PERSIST);
+  faixa_max_temp_param.addUIType(ESP_RMAKER_UI_SLIDER);
+  faixa_max_temp_param.addBounds(value(TEMP_MIN_LIMITE), value(TEMP_MAX_LIMITE), value(1));
+  my_horta->addParam(faixa_max_temp_param);
+
+  Param tempo_irrigacao_temp_param("Temp - Tempo Irrigação (min)", NULL, value(tempo_irrigacao_temp_min),
+                                   PROP_FLAG_READ | PROP_FLAG_WRITE | PROP_FLAG_PERSIST);
+  tempo_irrigacao_temp_param.addUIType(ESP_RMAKER_UI_SLIDER);
+  tempo_irrigacao_temp_param.addBounds(value(TEMPO_IRRIGACAO_MIN_LIMITE), value(TEMPO_IRRIGACAO_MAX_LIMITE), value(1));
+  my_horta->addParam(tempo_irrigacao_temp_param);
+
+  Param tempo_pausa_temp_param("Temp - Pausa Irrigação (min)", NULL, value(tempo_pausa_temp_min),
+                               PROP_FLAG_READ | PROP_FLAG_WRITE | PROP_FLAG_PERSIST);
+  tempo_pausa_temp_param.addUIType(ESP_RMAKER_UI_SLIDER);
+  tempo_pausa_temp_param.addBounds(value(TEMPO_PAUSA_MIN_LIMITE), value(TEMPO_PAUSA_MAX_LIMITE), value(1));
+  my_horta->addParam(tempo_pausa_temp_param);
+
+  Param irrigacao_faixa_temp_param("Temp - Irrigação da Faixa", NULL, value(irrigacao_da_faixa_temp),
+                                   PROP_FLAG_READ | PROP_FLAG_WRITE | PROP_FLAG_PERSIST);
+  irrigacao_faixa_temp_param.addUIType(ESP_RMAKER_UI_TOGGLE);
+  my_horta->addParam(irrigacao_faixa_temp_param);
+
+  my_horta->addCb(write_callback);
+  my_node.addDevice(*my_horta);
+  my_horta->updateAndReportParam("Saída Irrigação", saida_irrigacao_state);
+
+  startProvisioning();
+
+  Serial.printf("RainMaker iniciado em modo %s.\n", getProvModeName());
+  Serial.println("Modo Automático ON: Saída Irrigação segue solo OU temperatura.");
+  Serial.println("Modo Automático OFF: Saída Irrigação segue Comando Manual.");
+  Serial.print("Alterações de configuração são aplicadas automaticamente após ");
+  Serial.print(CONFIG_APPLY_DELAY_MS);
+  Serial.println(" ms sem novas mudanças.");
+}
+
+// ==============================
+// LOOP
+// ==============================
+void loop() {
+  handleBootButton();
+  handleTimerTemperatura();
+  handleAplicarConfiguracoesPendentes();
+  handleSensors();
+  
+  // A MÁGICA UDP ACONTECENDO AQUI
+  gritarStatusUDP();
+  
+  delay(10);
+}
