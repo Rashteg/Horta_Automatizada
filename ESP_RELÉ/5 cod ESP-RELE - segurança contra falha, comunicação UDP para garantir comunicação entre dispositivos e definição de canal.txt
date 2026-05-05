@@ -1,4 +1,4 @@
-// 2026-04-28 America/Sao_Paulo
+// 2026-04-28 America/Sao_Paulo.
 // ESP RainMaker - Relé Inteligente (Ouvinte UDP de Zonas 1 a 10 + Fail-Safe Corrigido)
 #include <Arduino.h>
 #include "RMaker.h"
